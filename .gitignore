@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.venv
+__pycache__
+main.py
+dataset/17k_dataset/reddit-health-17k-without-triples/
+dataset/17k_dataset/triples_output_17k/
+dataset/100k_dataset/reddit-health-86k-without-triples/
+dataset/100k_dataset/health_misinfo_speed_run.csv
+dataset/100k_dataset/triples_output_100k.parquet
+ground_truth/reddit_health_ground_truth.parquet
+semmed_verifier/semmedVER43_2024_R_PREDICATION.csv
+semmed_verifier/triples_cui_mapped.parquet
+semmed_verifier/triples_semmed_verified.parquet
+pubmed_verifier/pubmed_output/
+testing.csv
