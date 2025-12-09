@@ -22,6 +22,7 @@ dependencies = [
     "torch>=2.5.1",
     "faiss-gpu>=1.7.2",
     "vllm>=0.7.3",
+    "seaborn>=0.13.2",
 ]
 
 [[tool.uv.index]]

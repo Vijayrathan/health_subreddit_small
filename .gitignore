@@ -9,8 +9,11 @@ dataset/100k_dataset/reddit-health-86k-without-triples/
 dataset/100k_dataset/health_misinfo_speed_run.csv
 dataset/100k_dataset/triples_output_100k.parquet
 ground_truth/reddit_health_ground_truth.parquet
+ground_truth/reddit_health_full_annotated.parquet
 semmed_verifier/semmedVER43_2024_R_PREDICATION.csv
 semmed_verifier/triples_cui_mapped.parquet
 semmed_verifier/triples_semmed_verified.parquet
+semmed_verifier/triples_semmed_unified_claims.parquet
 pubmed_verifier/pubmed_output/
+pubmed_verifier/triples_pubmed_unified_claims.parquet
 testing.csv

@@ -1,14 +1,26 @@
 import requests
-import time
 import ast
-from datasets import load_from_disk
+import time
+import os
+from datasets import load_from_disk, Dataset
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+# --- CONFIGURATION ---
+# Get an API Key here: https://account.ncbi.nlm.nih.gov/
+# If you have one, paste it below to run 3x faster.
+API_KEY = "94aa205598ec90fd1b9650a486d2e7b03908"
+
+# Rate Limits: 
+# No Key = 3 req/sec -> Max Workers ~3
+# With Key = 10 req/sec -> Max Workers ~10
+MAX_WORKERS = 10 if API_KEY else 3 
 
 class PubMedMeshVerifier:
-    def __init__(self, email):
+    def __init__(self, email, api_key=None):
         self.email = email
+        self.api_key = api_key
         self.base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        # Use a session for connection pooling (faster/stable)
         self.session = requests.Session()
 
     def get_count(self, query):
@@ -19,116 +31,136 @@ class PubMedMeshVerifier:
             "email": self.email,
             "retmax": 0
         }
+        if self.api_key:
+            params["api_key"] = self.api_key
+            
         try:
             r = self.session.get(self.base_url, params=params, timeout=10)
+            
+            # Handle Rate Limiting (HTTP 429)
+            if r.status_code == 429:
+                time.sleep(2) # Backoff
+                return self.get_count(query) # Retry
+                
             r.raise_for_status()
             data = r.json()
             return int(data["esearchresult"]["count"])
-        except Exception as e:
+        except Exception:
             return 0
 
     def verify_claim(self, subject, user_predicate, object_term):
-        # 1. Subject IS the Therapy
+        # Queries
         query_therapy = (
             f'("{subject}"[Title] AND "therapeutic use"[sh]) AND "{object_term}"[Title/Abstract]'
         )
-        
-        # 2. Subject IS the Cause/Harm
         query_harm = (
             f'("{subject}"[Title] AND ("adverse effects"[sh] OR "toxicity"[sh] OR "etiology"[sh] OR "chemically induced"[sh])) '
             f'AND "{object_term}"[Title/Abstract]'
         )
 
         count_therapy = self.get_count(query_therapy)
-        time.sleep(0.34) # Rate limit
+        # Small sleep only if no API key to be extra safe inside the thread
+        if not self.api_key: time.sleep(0.2) 
         count_harm = self.get_count(query_harm)
         
         total = count_therapy + count_harm
 
         if total == 0:
-            return "ambiguous" # No data
+            return "UNVERIFIED"
 
-        # Calculate Ratio (Therapy / Harm)
-        # Handle division by zero safely by setting a high ceiling
         if count_harm == 0:
-            ratio = 999.0 # Effectively infinite positive signal
+            ratio = 999.0
         else:
             ratio = count_therapy / count_harm
 
         is_positive_claim = user_predicate.lower() in ["treats", "cures", "helps", "heals", "prevents"]
 
-        # --- ADJUSTED THRESHOLDS ---
         if is_positive_claim:
-            # User says "It Cures"
-            if ratio >= 2.0: 
-                return "true"
-            elif ratio <= 0.5:
-                return "false" # Evidence actually points to harm
-            else:
-                return "ambiguous" # Ratio between 0.5 and 2.0 (Controversial/Mixed)
+            if ratio >= 2.0: return "SUPPORTED"
+            elif ratio <= 0.5: return "UNVERIFIED"
+            else: return "AMBIGUOUS_SUPPORT"
         else:
-            # User says "It Causes" (Negative intent)
-            if ratio <= 0.5:
-                return "true" # Low therapy / High harm = True for "Causes"
-            elif ratio >= 2.0:
-                return "false" # High therapy / Low harm = False for "Causes"
-            else:
-                return "ambiguous" 
+            if ratio <= 0.5: return "SUPPORTED"
+            elif ratio >= 2.0: return "UNVERIFIED"
+            else: return "AMBIGUOUS_SUPPORT"
 
-# --- EXECUTION ---
-MY_EMAIL = "your_email@example.com"
-verifier = PubMedMeshVerifier(MY_EMAIL)
-
-print("Loading dataset: triples_output_cleaned")
-dataset = load_from_disk("triples_output_cleaned")
-
-claims = []
-total_triples = 0
-
-pbar = tqdm(enumerate(dataset), total=len(dataset))
-for idx, row in pbar:
+# --- WORKER FUNCTION ---
+# This runs inside each thread
+def process_single_row(row_data):
+    # We re-instantiate or pass the verifier. 
+    # Since requests.Session is thread-safe-ish, we can use a global or pass it.
+    # Ideally, instantiate a lightweight verifier here or use a shared one.
+    
+    verifier = row_data['verifier']
+    row = row_data['row']
+    
     try:
         triples_list = ast.literal_eval(row["triples"])
     except:
-        claims.append("na")
-        continue
+        return "UNVERIFIED"
     
     if not isinstance(triples_list, list) or len(triples_list) == 0:
-        claims.append("na")
-        continue
+        return "UNVERIFIED"
     
     triple_verdicts = []
     for triple in triples_list:
         if len(triple) != 3: continue
         subject, predicate, object_term = triple
         
-        # Filter: Skip generic triples that aren't medical claims
-        # This saves API calls and reduces noise
         if predicate not in ["treats", "cures", "helps", "heals", "causes", "worsens", "induces"]:
             continue
 
-        total_triples += 1
         verdict = verifier.verify_claim(subject, predicate, object_term)
         triple_verdicts.append(verdict)
-        time.sleep(0.35) 
     
-    # --- BETTER AGGREGATION LOGIC ---
+    # Aggregation
     if not triple_verdicts:
-        claims.append("na")
-    elif "true" in triple_verdicts and "false" not in triple_verdicts:
-        # If at least one medical triple is True and none are False -> TRUE
-        claims.append("true")
-    elif "false" in triple_verdicts:
-        # If any medical triple is demonstrably False -> FALSE (Safety priority)
-        claims.append("false")
+        return "UNVERIFIED"
+    elif "SUPPORTED" in triple_verdicts:
+        return "SUPPORTED"
+    elif "AMBIGUOUS_SUPPORT" in triple_verdicts:
+        return "AMBIGUOUS_SUPPORT"
     else:
-        # All ambiguous, or mix of ambiguous/na
-        claims.append("ambiguous")
-    
-    pbar.set_postfix({"triples": total_triples})
+        return "UNVERIFIED"
 
-print("Saving...")
-dataset = dataset.add_column("claim", claims)
-dataset.save_to_disk("triples_output_cleaned_verified")
-df=dataset.to_pandas()
-df['claim'].value_counts()
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    MY_EMAIL = "vijayrathank@gmail.com"
+
+    
+    # Initialize one verifier instance (Session handles connection pooling)
+    main_verifier = PubMedMeshVerifier(MY_EMAIL, API_KEY)
+
+    print("Loading dataset...")
+    dataset = pd.read_parquet("../dataset/100k_dataset/triples_output_100k.parquet")
+    dataset=Dataset.from_pandas(dataset)
+    
+    # Prepare data for threads
+    # We wrap the row and the verifier object together
+    tasks = [{'row': row, 'verifier': main_verifier} for row in dataset]
+    
+    results = []
+    print(f"Starting processing with {MAX_WORKERS} workers...")
+    
+    # ThreadPoolExecutor is better for Network I/O than ProcessPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        futures = {executor.submit(process_single_row, task): i for i, task in enumerate(tasks)}
+        
+        # We use a list of size N to keep order correct
+        results = [None] * len(tasks)
+        
+        # Process as they complete (with progress bar)
+        for future in tqdm(as_completed(futures), total=len(tasks)):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as e:
+                results[index] = "UNVERIFIED" # Fallback on crash
+
+    print("Saving...")
+    dataset = dataset.add_column("unified_claim_status", results)
+    dataset.to_parquet("triples_pubmed_unified_claims.parquet")
+    
+    df = pd.read_parquet("triples_pubmed_unified_claims.parquet")
+    print(df['unified_claim_status'].value_counts())
